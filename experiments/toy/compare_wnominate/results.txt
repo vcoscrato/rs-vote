@@ -1,0 +1,12 @@
+--- W-NOMINATE Parity Experiment ---
+Generating synthetic 1D roll call dataset...
+Dataset Details: 100 Legislators, 50 Roll Calls.
+Running models (R and PyTorch equivalents)...
+
+--- Pearson Correlations ---
+R wnominate vs PyTorch W-NOMINATE: 0.9945
+R wnominate vs PyTorch Alternating: 0.9956
+True Underlying Model vs PyTorch W-NOMINATE: 0.9915
+
+Saved plots to: /home/victor/Documents/rs-vote/experiments/compare_wnominate/wnominate_comparison.png
+Experiment completed successfully.
