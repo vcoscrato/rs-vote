@@ -12,3 +12,6 @@ wheels/
 
 # Other
 papers/
+
+# Datasets
+experiments/*/data/
