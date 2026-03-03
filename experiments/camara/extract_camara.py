@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 
-diretorio = os.path.join(os.path.dirname(__file__), '../optuna_real_data/data'/camara'
+diretorio = os.path.join(os.path.dirname(__file__), 'data')
 os.makedirs(diretorio, exist_ok=True)
 
 # Using complete range as in the author's script
@@ -14,7 +14,7 @@ for ano in anos:
     ano_int = int(ano)
     url = f'http://dadosabertos.camara.leg.br/arquivos/votacoesVotos/csv/votacoesVotos-{ano_int}.csv'
     try:
-        dt_corrente = pd.read_csv(url, sep=';', usecols=['idVotacao',os.path.join(os.path.dirname(__file__), '../optuna_real_data/data'HoraVoto','voto','deputado_id','deputado_nome','deputado_siglaPartido','deputado_siglaUf'])
+        dt_corrente = pd.read_csv(url, sep=';', usecols=['idVotacao','dataHoraVoto','voto','deputado_id','deputado_nome','deputado_siglaPartido','deputado_siglaUf'])
         dt_corrente = dt_corrente.loc[~pd.isnull(dt_corrente.voto)]
         dt_votos_list.append(dt_corrente)
         print(f"  [{ano_int}] Retrieved {len(dt_corrente)} votes.")

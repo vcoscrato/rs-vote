@@ -8,9 +8,9 @@ where = ["src"]
 [project]
 name = "rs-vote"
 version = "0.1.0"
-description = "Add your description here"
+description = "Recommender-Systems inspired alternatives to roll call scaling methods (W-NOMINATE, LMF, FM-COV)"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=2.4.2",

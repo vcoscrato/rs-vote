@@ -1,0 +1,9 @@
+--- 2D W-NOMINATE Parity & CV Experiment ---
+
+--- Structural Alignments ---
+R: wnominate (No CV) -> MSE: 0.0158 | D1 Corr: 0.919 | D2 Corr: 0.984
+Python: PyTorch W-NOMINATE (No CV) -> MSE: 0.0082 | D1 Corr: 0.986 | D2 Corr: 0.985
+Python: PyTorch W-NOMINATE (With 10% CV Holdout) -> MSE: 0.0089 | D1 Corr: 0.982 | D2 Corr: 0.983
+
+Saved plots to: /home/victor/Documents/rs-vote/experiments/toy/compare_2d_cv/wnominate_2d_cv_comparison.png
+Experiment completed successfully.

@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import torch
 
 
 class RollCallMatrix:
@@ -14,6 +15,9 @@ class RollCallMatrix:
         1: Yea
         0: Nay
        NaN: Missing / Abstain
+
+    All internal representations are stored as PyTorch tensors to avoid
+    redundant numpy↔tensor conversions during training.
     """
 
     def __init__(
@@ -32,14 +36,14 @@ class RollCallMatrix:
             rollcalls: Metadata for roll calls (shape: n_votes x n_features)
         """
         if isinstance(votes, pd.DataFrame):
-            self.votes = votes.values
+            votes_np = votes.values.astype(float)
         else:
-            self.votes = np.asarray(votes, dtype=float)
+            votes_np = np.asarray(votes, dtype=float)
 
-        self.n_legislators, self.n_votes = self.votes.shape
+        self.n_legislators, self.n_votes = votes_np.shape
 
         # Validation
-        unique_vals = np.unique(self.votes[~np.isnan(self.votes)])
+        unique_vals = np.unique(votes_np[~np.isnan(votes_np)])
         if not np.all(np.isin(unique_vals, [0, 1])):
             raise ValueError("Vote matrix must contain only 0, 1, or NaN.")
 
@@ -56,29 +60,88 @@ class RollCallMatrix:
                 "Rollcalls metadata must match the number of columns in votes."
             )
 
-    @property
-    def shape(self):
-        return self.n_legislators, self.n_votes
+        # ── Store as tensors directly ──────────────────────────────────
+        # COO sparse representation of observed entries
+        user_idx, item_idx = np.where(~np.isnan(votes_np))
+        labels = votes_np[user_idx, item_idx]
 
-    def to_pytorch_tensors(self):
-        """
-        Converts the matrix to PyTorch tensors suitable for model training.
-        Returns:
-            user_idx: Tensor of legislator indices
-            item_idx: Tensor of vote indices
-            labels: Tensor of binary vote outcomes (0 or 1)
-        """
-        import torch
+        self.user_idx = torch.tensor(user_idx, dtype=torch.long)
+        self.item_idx = torch.tensor(item_idx, dtype=torch.long)
+        self.labels = torch.tensor(labels, dtype=torch.float32)
 
-        # Get indices of non-NaN values
-        user_idx, item_idx = np.where(~np.isnan(self.votes))
-        labels = self.votes[user_idx, item_idx]
-
-        return (
-            torch.tensor(user_idx, dtype=torch.long),
-            torch.tensor(item_idx, dtype=torch.long),
-            torch.tensor(labels, dtype=torch.float32),
+        # Pre-compute covariate tensors (once, at construction)
+        self.user_cov_tensors, self.user_cov_dims = self._factorize_covariates(
+            self.legislators
         )
+        self.item_cov_tensors, self.item_cov_dims = self._factorize_covariates(
+            self.rollcalls
+        )
+
+    @staticmethod
+    def _factorize_covariates(
+        metadata: pd.DataFrame | None,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
+        """
+        Parses metadata for any columns prefixed with `cov_` and converts them
+        to integer-coded LongTensors suitable for nn.Embedding.
+
+        Returns:
+            tensors: Dict mapping column name to LongTensor of integer codes
+            dims: Dict mapping column name to the number of unique categories
+        """
+        tensors = {}
+        dims = {}
+        if metadata is not None:
+            for col in metadata.columns:
+                if str(col).startswith("cov_"):
+                    codes, uniques = pd.factorize(metadata[col])
+                    # Shift codes: factorize returns -1 for NaN, we shift to 0
+                    tensors[col] = torch.tensor(codes + 1, dtype=torch.long)
+                    dims[col] = len(uniques) + 1
+        return tensors, dims
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.n_legislators, self.n_votes)
+
+    def __repr__(self):
+        return f"RollCallMatrix(n_legislators={self.n_legislators}, n_votes={self.n_votes})"
+
+    def __eq__(self, other):
+        if not isinstance(other, RollCallMatrix):
+            return False
+        return (
+            torch.equal(self.user_idx, other.user_idx)
+            and torch.equal(self.item_idx, other.item_idx)
+            and torch.equal(self.labels, other.labels)
+        )
+
+    def to_pytorch_tensors(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns the COO sparse representation as PyTorch tensors.
+
+        Returns:
+            user_idx: LongTensor of legislator indices
+            item_idx: LongTensor of vote indices
+            labels: FloatTensor of binary vote outcomes (0 or 1)
+        """
+        return self.user_idx, self.item_idx, self.labels
+
+    def get_user_covariate_tensors(
+        self, user_idx: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Index user covariate tensors by observation-level user indices."""
+        return {name: t[user_idx] for name, t in self.user_cov_tensors.items()}
+
+    def get_item_covariate_tensors(
+        self, item_idx: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Index item covariate tensors by observation-level item indices."""
+        return {name: t[item_idx] for name, t in self.item_cov_tensors.items()}
+
+    def get_all_user_covariate_tensors(self) -> dict[str, torch.Tensor]:
+        """Return full user covariate tensors (one entry per legislator)."""
+        return self.user_cov_tensors
 
     def train_test_split(self, test_size: float = 0.1, random_state: int | None = None):
         """
@@ -93,70 +156,29 @@ class RollCallMatrix:
             train_matrix: A RollCallMatrix with test votes set to NaN.
             test_matrix: A RollCallMatrix containing ONLY the test votes (others NaN).
         """
-        if random_state is not None:
-            np.random.seed(random_state)
+        # We need to reconstruct numpy arrays for the split, then build new
+        # RollCallMatrix objects which will immediately convert back to tensors.
+        votes_np = np.full((self.n_legislators, self.n_votes), np.nan)
+        u = self.user_idx.numpy()
+        i = self.item_idx.numpy()
+        l = self.labels.numpy()
+        votes_np[u, i] = l
 
-        # Identify all observed (non-NaN) indices
-        user_idx, item_idx = np.where(~np.isnan(self.votes))
-        n_observed = len(user_idx)
-
-        # Shuffle and split
-        indices = np.random.permutation(n_observed)
+        rng = np.random.default_rng(random_state)
+        n_observed = len(u)
+        indices = rng.permutation(n_observed)
         n_test = int(n_observed * test_size)
 
         test_indices = indices[:n_test]
         train_indices = indices[n_test:]
 
-        # Create Train Matrix
-        train_votes = np.full_like(self.votes, np.nan)
-        train_u = user_idx[train_indices]
-        train_i = item_idx[train_indices]
-        votes_arr = np.asarray(self.votes)
-        train_votes[train_u, train_i] = votes_arr[train_u, train_i]
+        train_votes = np.full_like(votes_np, np.nan)
+        train_votes[u[train_indices], i[train_indices]] = l[train_indices]
 
-        # Create Test Matrix
-        test_votes = np.full_like(self.votes, np.nan)
-        test_u = user_idx[test_indices]
-        test_i = item_idx[test_indices]
-        test_votes[test_u, test_i] = votes_arr[test_u, test_i]
+        test_votes = np.full_like(votes_np, np.nan)
+        test_votes[u[test_indices], i[test_indices]] = l[test_indices]
 
         train_mat = RollCallMatrix(train_votes, self.legislators, self.rollcalls)
         test_mat = RollCallMatrix(test_votes, self.legislators, self.rollcalls)
 
         return train_mat, test_mat
-
-    def get_user_covariates(self) -> tuple[dict[str, np.ndarray], dict[str, int]]:
-        """
-        Parses `legislators` metadata for any columns prefixed with `cov_`.
-        Returns:
-            covs: Dict mapping column name to integer encoded arrays suitable for nn.Embedding
-            dims: Dict mapping column name to the number of unique categories
-        """
-        covs = {}
-        dims = {}
-        if self.legislators is not None:
-            for col in self.legislators.columns:
-                if str(col).startswith("cov_"):
-                    # Factorize missing to -1, shift to 0
-                    codes, uniques = pd.factorize(self.legislators[col])
-                    covs[col] = codes + 1
-                    dims[col] = len(uniques) + 1
-        return covs, dims
-
-    def get_item_covariates(self) -> tuple[dict[str, np.ndarray], dict[str, int]]:
-        """
-        Parses `rollcalls` metadata for any columns prefixed with `cov_`.
-        Returns:
-            covs: Dict mapping column name to integer encoded arrays suitable for nn.Embedding
-            dims: Dict mapping column name to the number of unique categories
-        """
-        covs = {}
-        dims = {}
-        if self.rollcalls is not None:
-            for col in self.rollcalls.columns:
-                if str(col).startswith("cov_"):
-                    # Factorize missing to -1, shift to 0
-                    codes, uniques = pd.factorize(self.rollcalls[col])
-                    covs[col] = codes + 1
-                    dims[col] = len(uniques) + 1
-        return covs, dims

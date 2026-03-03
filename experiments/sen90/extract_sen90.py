@@ -29,9 +29,10 @@ try:
     
     # Save to disk
     import os
-    os.makedirs(os.path.join(os.path.dirname(__file__), "../optuna_real_data/data"", exist_ok=True)
-    votes_df.to_csv(os.path.join(os.path.dirname(__file__), "../optuna_real_data/data"/sen90_votes.csv", index=False)
-    legis_df.to_csv(os.path.join(os.path.dirname(__file__), "../optuna_real_data/data"/sen90_legis.csv", index=False)
+    data_dir = os.path.join(os.path.dirname(__file__), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    votes_df.to_csv(os.path.join(data_dir, "sen90_votes.csv"), index=False)
+    legis_df.to_csv(os.path.join(data_dir, "sen90_legis.csv"), index=False)
     print("Successfully extracted sen90 data to CSVs.")
 except Exception as e:
     print(f"Error extracting data: {e}")

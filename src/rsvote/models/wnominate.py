@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score, roc_auc_score
 from torch.optim import Adam
 from tqdm.auto import tqdm
 
@@ -8,68 +7,126 @@ from ..data.matrix import RollCallMatrix
 from .base import BaseRollCallModel
 
 
-class WNominate(BaseRollCallModel, nn.Module):
+class WNominate(BaseRollCallModel):
     """
-    PyTorch implementation of the W-NOMINATE spatial model.
+    PyTorch implementation of the W-NOMINATE spatial voting model.
 
-    Instead of Alternating Optimization, we use Gradient Descent to minimize
-    the Negative Log-Likelihood of the Vote Matrix.
+    Follows the original Poole & Rosenthal formulation exactly:
 
-    Utility(yea) = exp(-0.5 * ||x_i - z_jy||^2)
-    Probability(yea) = Utility(yea) / (Utility(yea) + Utility(nay))
-                     = sigmoid( 0.5 * (||x_i - z_jn||^2 - ||x_i - z_jy||^2) )
+        Utility(yea) = beta * exp(-0.5 * sum_k[ w_k^2 * (x_ik - z_jy_k)^2 ])
+        Utility(nay) = beta * exp(-0.5 * sum_k[ w_k^2 * (x_ik - z_jn_k)^2 ])
 
-    We reparameterize the votes as a midpoint `z_mid` and a direction `z_spread`
-    to simplify optimization, which is standard in more recent implementations.
+        Probability(yea) = sigmoid( Utility(yea) - Utility(nay) )
+
+    Where x_i is the legislator ideal point, z_jy is the yea outcome location,
+    z_jn is the nay outcome location, beta is the signal-to-noise parameter,
+    and w_k are dimensional weights.
+
+    Using the midpoint/spread reparameterization:
+        z_jy = z_mid_j + z_spread_j
+        z_jn = z_mid_j - z_spread_j
+
+    Parameters:
+        - beta: Signal-to-noise ratio (estimated, initialized to 15.0)
+        - w_1 = 1.0: First dimension weight (fixed for identification)
+        - w_k (k>=2): Estimated dimension weights (initialized to 0.5)
+        - Ideal points are constrained to the unit hypersphere (||x_i|| <= 1)
+
+    Two optimization methods are supported:
+        - "gradient_descent": Joint SGD over all parameters
+        - "alternating": Three-step procedure matching the original algorithm
     """
 
-    def __init__(self, n_dims: int = 2, beta: float = 15.0):
-        if n_dims == 0:
+    def __init__(
+        self,
+        n_dims: int = 2,
+        init_beta: float = 15.0,
+        init_weights: float = 0.5,
+        method: str = "gradient_descent",
+        epochs: int = 1500,
+        lr: float = 0.05,
+        alternating_inner_steps: int = 50,
+        convergence_corr: float = 0.99,
+        verbose: bool = True,
+    ):
+        super().__init__()
+        if n_dims < 1:
             raise ValueError(
-                "WNominate inherently requires spatial modeling (n_dims > 0). If you want 0-dimensional pure collaborative filtering, use LogisticMatrixFactorization."
+                "WNominate requires at least 1 spatial dimension (n_dims >= 1)."
             )
-        BaseRollCallModel.__init__(self, n_dims=n_dims, beta=beta)
-        nn.Module.__init__(self)
+        if method not in ["gradient_descent", "alternating"]:
+            raise ValueError("method must be 'gradient_descent' or 'alternating'")
+
         self.n_dims = n_dims
-        self.beta = beta  # Temperature parameter
+        self.init_beta = init_beta
+        self.init_weights = init_weights
+        self.method = method
+        self.epochs = epochs
+        self.lr = lr
+        self.alternating_inner_steps = alternating_inner_steps
+        self.convergence_corr = convergence_corr
+        self.verbose = verbose
 
     def _initialize_parameters(self, n_users: int, n_items: int):
+        # Learnable beta (signal-to-noise)
+        self.beta = nn.Parameter(torch.tensor(self.init_beta))
+
+        # Dimension weights: w_1 = 1.0 (fixed), w_k (k>=2) learnable
+        if self.n_dims > 1:
+            self.dim_weights = nn.Parameter(
+                torch.full((self.n_dims - 1,), self.init_weights)
+            )
+
+        # Spatial parameters
         self.ideal_points = nn.Embedding(n_users, self.n_dims)
         self.vote_midpoints = nn.Embedding(n_items, self.n_dims)
         self.vote_spreads = nn.Embedding(n_items, self.n_dims)
 
-        # W-NOMINATE bounds ideal points between -1 and 1
         nn.init.uniform_(self.ideal_points.weight, -0.5, 0.5)
         nn.init.uniform_(self.vote_midpoints.weight, -0.5, 0.5)
         nn.init.normal_(self.vote_spreads.weight, std=0.5)
 
         self.to(self.device)
 
+    def _get_weights_squared(self) -> torch.Tensor:
+        w1 = torch.ones(1, device=self.device)
+        if self.n_dims > 1:
+            return torch.cat([w1, self.dim_weights**2])
+        return w1
+
     def forward(self, user_idx: torch.Tensor, item_idx: torch.Tensor) -> torch.Tensor:
         """
-        Calculates the logit (pre-sigmoid) difference in utilities.
+        Computes the logit (pre-sigmoid) for the given user-item pairs using
+        the exact Gaussian utility difference.
         """
-        x_i = self.ideal_points(user_idx)
-        z_mid = self.vote_midpoints(item_idx)
-        z_spread = self.vote_spreads(item_idx)
+        x_i = self.ideal_points(user_idx)  # (N, D)
+        z_mid = self.vote_midpoints(item_idx)  # (N, D)
+        z_spread = self.vote_spreads(item_idx)  # (N, D)
 
-        # The logit in this parameterization is proportional to the
-        # dot product of the distance from the midpoint and the spread vector.
-        # Logit = beta * (x_i - z_mid) . z_spread
+        z_yea = z_mid + z_spread
+        z_nay = z_mid - z_spread
 
-        diff = x_i - z_mid
-        logit = self.beta * (diff * z_spread).sum(dim=1)
+        w_sq = self._get_weights_squared()  # (D,)
 
-        return logit
+        # Distances
+        d_yea_sq = (w_sq * (x_i - z_yea) ** 2).sum(dim=1)
+        d_nay_sq = (w_sq * (x_i - z_nay) ** 2).sum(dim=1)
 
-    def fit(
-        self,
-        X: RollCallMatrix,
-        X_val: RollCallMatrix | None = None,
-        epochs: int = 1500,
-        lr: float = 0.05,
-        verbose: bool = True,
-    ) -> WNominate:
+        # Utilities
+        u_yea = self.beta * torch.exp(-0.5 * d_yea_sq)
+        u_nay = self.beta * torch.exp(-0.5 * d_nay_sq)
+
+        return u_yea - u_nay
+
+    def _project_ideal_points(self):
+        """Project ideal points back onto the unit ball (||x_i|| <= 1)."""
+        with torch.no_grad():
+            norms = torch.norm(self.ideal_points.weight, dim=1, keepdim=True)
+            mask = (norms > 1.0).squeeze(-1)
+            if mask.any():
+                self.ideal_points.weight[mask] /= norms[mask]
+
+    def fit(self, X: RollCallMatrix, X_val: RollCallMatrix | None = None) -> "WNominate":
         n_users, n_items = X.shape
         self._initialize_parameters(n_users, n_items)
 
@@ -78,16 +135,27 @@ class WNominate(BaseRollCallModel, nn.Module):
         item_idx = item_idx.to(self.device)
         labels = labels.to(self.device)
 
+        val_data = None
         if X_val is not None:
-            val_user_idx, val_item_idx, val_labels = X_val.to_pytorch_tensors()
-            val_user_idx = val_user_idx.to(self.device)
-            val_item_idx = val_item_idx.to(self.device)
-            val_labels = val_labels.to(self.device)
+            v_u, v_i, v_l = X_val.to_pytorch_tensors()
+            val_data = (v_u.to(self.device), v_i.to(self.device), v_l.to(self.device))
 
-        optimizer = Adam(self.parameters(), lr=lr)
         loss_fn = nn.BCEWithLogitsLoss()
 
-        pbar = tqdm(range(epochs), desc="Training W-NOMINATE", disable=not verbose)
+        if self.method == "alternating":
+            self._fit_alternating(user_idx, item_idx, labels, val_data, loss_fn)
+        else:
+            self._fit_gradient_descent(user_idx, item_idx, labels, val_data, loss_fn)
+
+        self._is_fitted = True
+        return self
+
+    def _fit_gradient_descent(self, user_idx, item_idx, labels, val_data, loss_fn):
+        optimizer = Adam(self.parameters(), lr=self.lr)
+
+        pbar = tqdm(
+            range(self.epochs), desc="W-NOMINATE (SGD)", disable=not self.verbose
+        )
         for epoch in pbar:
             self.train()
             optimizer.zero_grad()
@@ -95,60 +163,114 @@ class WNominate(BaseRollCallModel, nn.Module):
             logits = self(user_idx, item_idx)
             loss = loss_fn(logits, labels)
 
-            # L2 Regularization (weight decay equivalent) to constrain space
-            l2_reg = torch.tensor(0.0, device=self.device)
-            for param in self.parameters():
-                l2_reg = l2_reg + torch.norm(param)
-            loss = loss + 0.001 * l2_reg
-
             loss.backward()
             optimizer.step()
+            self._project_ideal_points()
 
-            # W-Nominate traditionally constrains ideal points to the unit hypersphere
+            if epoch % 10 == 0 or epoch == self.epochs - 1:
+                metrics = {"loss": f"{loss.item():.4f}", "β": f"{self.beta.item():.2f}"}
+                if self.n_dims > 1:
+                    w_str = ",".join(
+                        f"{w:.2f}" for w in self.dim_weights.detach().cpu().tolist()
+                    )
+                    metrics["w"] = w_str
+                if val_data is not None:
+                    self.eval()
+                    with torch.no_grad():
+                        val_logits = self(val_data[0], val_data[1])
+                    val_metrics = self._compute_val_metrics(
+                        val_logits, val_data[2], loss_fn
+                    )
+                    metrics.update(val_metrics)
+                pbar.set_postfix(metrics)
+
+    def _fit_alternating(self, user_idx, item_idx, labels, val_data, loss_fn):
+        bill_params = [self.vote_midpoints.weight, self.vote_spreads.weight]
+        leg_params = [self.ideal_points.weight]
+        hyper_params = [self.beta]
+        if self.n_dims > 1:
+            hyper_params.append(self.dim_weights)
+
+        opt_bills = Adam(bill_params, lr=self.lr)
+        opt_legs = Adam(leg_params, lr=self.lr)
+        opt_hyper = Adam(hyper_params, lr=self.lr * 0.1)
+
+        prev_all_params = None
+
+        pbar = tqdm(
+            range(self.epochs),
+            desc="W-NOMINATE (Alternating)",
+            disable=not self.verbose,
+        )
+        for outer in pbar:
+            # Step 1: Optimize bill parameters
+            self._freeze_all_except(bill_params)
+            for _ in range(self.alternating_inner_steps):
+                opt_bills.zero_grad()
+                logits = self(user_idx, item_idx)
+                loss = loss_fn(logits, labels)
+                loss.backward()
+                opt_bills.step()
+
+            # Step 2: Optimize legislator ideal points
+            self._freeze_all_except(leg_params)
+            for _ in range(self.alternating_inner_steps):
+                opt_legs.zero_grad()
+                logits = self(user_idx, item_idx)
+                loss = loss_fn(logits, labels)
+                loss.backward()
+                opt_legs.step()
+                self._project_ideal_points()
+
+            # Step 3: Optimize beta and dimension weights
+            self._freeze_all_except(hyper_params)
+            for _ in range(self.alternating_inner_steps):
+                opt_hyper.zero_grad()
+                logits = self(user_idx, item_idx)
+                loss = loss_fn(logits, labels)
+                loss.backward()
+                opt_hyper.step()
+
+            for p in self.parameters():
+                p.requires_grad = True
+
             with torch.no_grad():
-                norms = torch.norm(self.ideal_points.weight, dim=1, keepdim=True)
-                mask = norms > 1.0
-                if mask.any():
-                    self.ideal_points.weight[mask.squeeze(-1)] /= norms[
-                        mask.squeeze(-1)
-                    ]
+                new_all_params = torch.cat([p.data.flatten() for p in self.parameters()])
 
-            # Evaluation
-            if X_val is not None and (epoch % 10 == 0 or epoch == epochs - 1):
+            converged = False
+            if prev_all_params is not None:
+                corr = torch.corrcoef(torch.stack([prev_all_params, new_all_params]))[
+                    0, 1
+                ]
+                converged = corr.item() >= self.convergence_corr
+
+            prev_all_params = new_all_params
+
+            metrics = {"loss": f"{loss.item():.4f}", "β": f"{self.beta.item():.2f}"}
+            if self.n_dims > 1:
+                w_str = ",".join(
+                    f"{w:.2f}" for w in self.dim_weights.detach().cpu().tolist()
+                )
+                metrics["w"] = w_str
+            if val_data is not None:
                 self.eval()
                 with torch.no_grad():
-                    val_logits = self(val_user_idx, val_item_idx)
-                    val_loss = loss_fn(val_logits, val_labels)
+                    val_logits = self(val_data[0], val_data[1])
+                val_metrics = self._compute_val_metrics(val_logits, val_data[2], loss_fn)
+                metrics.update(val_metrics)
+            pbar.set_postfix(metrics)
 
-                    val_probs = torch.sigmoid(val_logits)
-                    val_preds = (val_probs > 0.5).float()
-                    val_acc = val_preds.eq(val_labels).float().mean()
-
-                    try:
-                        val_auc = roc_auc_score(
-                            val_labels.cpu().numpy(), val_probs.cpu().numpy()
-                        )
-                        val_f1 = f1_score(
-                            val_labels.cpu().numpy(), val_preds.cpu().numpy()
-                        )
-                    except ValueError:
-                        val_auc = float("nan")
-                        val_f1 = float("nan")
-
-                    pbar.set_postfix(
-                        {
-                            "loss": f"{loss.item():.4f}",
-                            "v_loss": f"{val_loss.item():.4f}",
-                            "v_acc": f"{val_acc.item():.4f}",
-                            "v_auc": f"{val_auc:.4f}",
-                            "v_f1": f"{val_f1:.4f}",
-                        }
+            if converged:
+                if self.verbose:
+                    pbar.write(
+                        f"Converged at outer iteration {outer} (corr >= {self.convergence_corr})"
                     )
-            elif epoch % 10 == 0 or epoch == epochs - 1:
-                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                break
 
-        self._is_fitted = True
-        return self
+    def _freeze_all_except(self, active_params: list):
+        active_set = {id(p) for p in active_params}
+        for p in self.parameters():
+            p.requires_grad = id(p) in active_set
 
     def predict_proba(self, X: RollCallMatrix) -> torch.Tensor:
         self._check_is_fitted()
