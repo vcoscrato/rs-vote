@@ -143,40 +143,73 @@ class RollCallMatrix:
         """Return full user covariate tensors (one entry per legislator)."""
         return self.user_cov_tensors
 
-    def train_test_split(self, test_size: float = 0.1, random_state: int | None = None):
+    def train_test_split(self, test_size: float = 0.1, n_last_votes: int | None = None, random_state: int | None = None):
         """
-        Splits the RollCallMatrix into a training and a testing set by masking out
-        a percentage of the observed votes.
+        Splits the RollCallMatrix into a training and a testing set.
 
         Args:
             test_size: Proportion of observed votes to include in the test split.
+                       Ignored if `n_last_votes` is provided.
+            n_last_votes: If provided, instead of a random global split, the last
+                          `n_last_votes` items for each user will be placed in the test set.
+                          The method assumes item indices represent chronological order.
             random_state: Seed for the random number generator.
 
         Returns:
             train_matrix: A RollCallMatrix with test votes set to NaN.
             test_matrix: A RollCallMatrix containing ONLY the test votes (others NaN).
         """
-        # We need to reconstruct numpy arrays for the split, then build new
-        # RollCallMatrix objects which will immediately convert back to tensors.
         votes_np = np.full((self.n_legislators, self.n_votes), np.nan)
         u = self.user_idx.numpy()
         i = self.item_idx.numpy()
         l = self.labels.numpy()
         votes_np[u, i] = l
 
-        rng = np.random.default_rng(random_state)
         n_observed = len(u)
-        indices = rng.permutation(n_observed)
-        n_test = int(n_observed * test_size)
+        test_mask = np.zeros(n_observed, dtype=bool)
 
-        test_indices = indices[:n_test]
-        train_indices = indices[n_test:]
+        if n_last_votes is not None:
+            # Time-dependent split per user
+            # Group observations by user
+            # Note: since COO extraction goes row by row and within row column by column,
+            # this is already sorted if item indices are sorted. But we sort to be safe.
+            df_obs = pd.DataFrame({'u': u, 'i': i, 'idx': np.arange(n_observed)})
+            
+            # Sort by user then item index (assuming item index is chronological)
+            df_obs = df_obs.sort_values(['u', 'i'])
+            
+            # For each user, pick the last N items
+            # Avoid putting ALL items of a user in test: leave at least 1 item in train
+            def get_test_idx(group):
+                n_available = len(group)
+                # Keep at least 1 item for training
+                n_test = min(n_last_votes, n_available - 1)
+                if n_test <= 0:
+                    return pd.Series(dtype=int)
+                return group['idx'].tail(n_test)
+                
+            test_indices = df_obs.groupby('u', as_index=False).apply(get_test_idx).values
+            if len(test_indices) > 0:
+                test_mask[test_indices.astype(int)] = True
+                
+        else:
+            # Global random split
+            rng = np.random.default_rng(random_state)
+            indices = rng.permutation(n_observed)
+            n_test = int(n_observed * test_size)
+            test_indices = indices[:n_test]
+            test_mask[test_indices] = True
 
+        train_indices = ~test_mask
+
+        # Masking for train
         train_votes = np.full_like(votes_np, np.nan)
         train_votes[u[train_indices], i[train_indices]] = l[train_indices]
 
+        # Masking for test
         test_votes = np.full_like(votes_np, np.nan)
-        test_votes[u[test_indices], i[test_indices]] = l[test_indices]
+        test_mask_idx = np.where(test_mask)[0]
+        test_votes[u[test_mask_idx], i[test_mask_idx]] = l[test_mask_idx]
 
         train_mat = RollCallMatrix(train_votes, self.legislators, self.rollcalls)
         test_mat = RollCallMatrix(test_votes, self.legislators, self.rollcalls)
